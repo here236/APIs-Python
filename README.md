@@ -1,7 +1,8 @@
 # APIs-Python
 
-Estudo sobre consumo de APIs em Python  
+grupo:Alexandre Fontes, Deyvid Borges, Gabriel Campos, Henry Costa
 
+Estudo sobre consumo de APIs em Python  
 
 ## Clonando o repositório
 
