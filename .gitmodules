@@ -1,0 +1,3 @@
+[submodule "gnews-api"]
+	path = gnews-api
+	url = https://github.com/deyvidborges-dev/gnews-api.git
