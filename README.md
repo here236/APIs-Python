@@ -1,6 +1,6 @@
 # APIs-Python
 
-grupo:Alexandre Fontes, Deyvid Borges, Gabriel Campos, Henry Costa
+grupo:Alexandre Fontes, Deyvid Borges, Gabriel Campos, Henry Costa, Mateus Lima
 
 Estudo sobre consumo de APIs em Python  
 
