@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Monitor de Indicadores Agropecuários e Climáticos
-=================================================
-Cruza produção agrícola municipal/estadual (IBGE, PAM - tabela 5457 do SIDRA,
-via API de Agregados) com séries climáticas mensais (precipitação e temperatura).
-
-Uso:
-    python monitor_agro.py                       # modo interativo
-    python monitor_agro.py --uf MT --cultura soja --anos 15
-    python monitor_agro.py --uf PR --cultura milho --meses 1 2 3 4 --modo grafico
-    python monitor_agro.py --cultura soja --modo mapa
-
-Saídas (pasta ./saida): HTML interativos (Plotly) + PNG estático (matplotlib).
-"""
 import argparse
 import calendar
 import hashlib
@@ -30,7 +16,6 @@ from plotly.subplots import make_subplots
 IBGE = "https://servicodados.ibge.gov.br/api/v3"
 NASA_POWER = "https://power.larc.nasa.gov/api/temporal/monthly/point"
 TABELA_PAM = 5457          # PAM - Produção Agrícola Municipal (1974-...)
-CLASSIF_PRODUTO = "782"    # classificação "Produto das lavouras"
 VARIAVEIS = {"112": "rendimento_kg_ha", "214": "producao_t", "216": "area_colhida_ha"}
 
 CACHE_DIR = Path(".cache_agro")
@@ -49,9 +34,10 @@ UFS = {
     51: ("MT", -12.64, -55.42), 52: ("GO", -15.98, -49.86), 53: ("DF", -15.83, -47.86),
 }
 SIGLA_PARA_COD = {v[0]: k for k, v in UFS.items()}
+SIGLA_UF = {k: v[0] for k, v in UFS.items()}
 
 
-# ----------------------------------------------------------------- utilidades
+# ----- utilidades
 def norm(txt: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", txt.lower())
                    if unicodedata.category(c) != "Mn")
@@ -70,24 +56,57 @@ def get_json(url: str, params: dict | None = None):
     return dados
 
 
-# ----------------------------------------------------------------------- IBGE
-def resolver_cultura(nome: str) -> tuple[str, str]:
-    """Descobre o id da categoria da cultura consultando os metadados da tabela."""
+# ------ IBGE
+def resolver_cultura(nome: str) -> list[tuple[str, str, str]]:
+    """Lista de candidatas (id da classificação, id da categoria, nome), da melhor p/ pior.
+
+    O id da classificação NÃO é fixo: é localizado pelo nome ("Produto das lavouras...").
+    O ranking prefere o produto "principal" (ex.: "Milho (em grão)") e deixa por último
+    variantes como "Milho verde", "1ª safra", "para forragem".
+    """
     meta = get_json(f"{IBGE}/agregados/{TABELA_PAM}/metadados")
-    classif = next(c for c in meta["classificacoes"] if c["id"] == CLASSIF_PRODUTO)
+    classifs = meta.get("classificacoes", [])
+    if not classifs:
+        sys.exit(f"A tabela {TABELA_PAM} não retornou classificações. Resposta: {list(meta)}")
+    classif = next((c for c in classifs if "produto" in norm(c["nome"])), None)
+    if classif is None:  # fallback: a classificação com mais categorias
+        classif = max(classifs, key=lambda c: len(c.get("categorias", [])))
     alvo = norm(nome)
     cands = [c for c in classif["categorias"] if alvo in norm(c["nome"])]
     if not cands:
-        sys.exit(f"Cultura '{nome}' não encontrada na tabela {TABELA_PAM}.")
-    cands.sort(key=lambda c: (not norm(c["nome"]).startswith(alvo), len(c["nome"])))
-    return str(cands[0]["id"]), cands[0]["nome"]
+        sys.exit(f"Cultura '{nome}' não encontrada na classificação '{classif['nome']}'.")
+
+    def rank(c):
+        n = norm(c["nome"])
+        return (not n.startswith(alvo),
+                any(t in n for t in ("safra", "verde", "forrag", "semente", "muda")),
+                not any(t in n for t in ("em grao", "em casca", "em caroco", "herbaceo")),
+                len(n))
+
+    cands.sort(key=rank)
+    return [(str(classif["id"]), str(c["id"]), c["nome"]) for c in cands]
 
 
-def buscar_pam(cat_id: str, n_anos: int) -> pd.DataFrame:
+def buscar_cultura(cultura: str, n_anos: int, cod: int | None = None):
+    """Tenta as candidatas em ordem até achar uma com dados (para a UF, se informada)."""
+    cands = resolver_cultura(cultura)
+    print("→ Candidatas:", " | ".join(n for _, _, n in cands[:6]))
+    for classif_id, cat_id, nome in cands[:6]:
+        pam = buscar_pam(classif_id, cat_id, n_anos)
+        sub = pam if cod is None else pam[pam["cod"] == cod]
+        if not sub[["producao_t", "rendimento_kg_ha"]].dropna(how="all").empty:
+            print(f"→ Usando: {nome} (id {cat_id})")
+            return nome, sub
+        print(f"  (sem dados para '{nome}', tentando a próxima)")
+    alvo = f" em {SIGLA_UF.get(cod, cod)}" if cod else ""
+    sys.exit(f"Nenhuma variante de '{cultura}' tem dados{alvo} no período.")
+
+
+def buscar_pam(classif_id: str, cat_id: str, n_anos: int) -> pd.DataFrame:
     """Produção, área colhida e rendimento por UF nos últimos n anos."""
     vars_ = "|".join(VARIAVEIS)
     url = (f"{IBGE}/agregados/{TABELA_PAM}/periodos/-{n_anos}/variaveis/{vars_}"
-           f"?localidades=N3[all]&classificacao={CLASSIF_PRODUTO}[{cat_id}]")
+           f"?localidades=N3[all]&classificacao={classif_id}[{cat_id}]")
     dados = get_json(url)
     linhas = []
     for var in dados:
@@ -98,8 +117,12 @@ def buscar_pam(cat_id: str, n_anos: int) -> pd.DataFrame:
                                    "ano": int(ano), "valor": val})
     df = pd.DataFrame(linhas)
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")  # "-", "...", "X" -> NaN
-    return (df.pivot_table(index=["cod", "ano"], columns="var", values="valor")
-              .rename(columns=VARIAVEIS).reset_index())
+    pam = (df.pivot_table(index=["cod", "ano"], columns="var", values="valor")
+             .rename(columns=VARIAVEIS).reset_index())
+    for col in VARIAVEIS.values():
+        if col not in pam:
+            pam[col] = float("nan")
+    return pam
 
 
 def buscar_malha_ufs() -> dict:
@@ -108,7 +131,7 @@ def buscar_malha_ufs() -> dict:
                      "qualidade": "minima", "intrarregiao": "UF"})
 
 
-# ---------------------------------------------------------------------- clima
+# ----clima
 def clima_anual(cod_uf: int, ano_ini: int, ano_fim: int,
                 meses: list[int] | None = None) -> pd.DataFrame:
     """Precipitação acumulada (mm) e temperatura média (°C) por ano, via NASA POWER.
@@ -139,14 +162,10 @@ def clima_anual(cod_uf: int, ano_ini: int, ano_fim: int,
                                  temp_c=("temp_c", "mean")).reset_index()
 
 
-# ------------------------------------------------------------- Desafio 1
+# ---Desafio 1
 def grafico_comparativo(uf: str, cultura: str, n_anos: int, meses, saida: Path):
     cod = SIGLA_PARA_COD[uf]
-    cat_id, nome_cultura = resolver_cultura(cultura)
-    pam = buscar_pam(cat_id, n_anos)
-    pam = pam[pam["cod"] == cod]
-    if pam.empty:
-        sys.exit(f"Sem dados de {nome_cultura} para {uf}.")
+    nome_cultura, pam = buscar_cultura(cultura, n_anos, cod)
     clima = clima_anual(cod, int(pam["ano"].min()), int(pam["ano"].max()), meses)
     df = pam.merge(clima, on="ano").sort_values("ano")
 
@@ -155,3 +174,115 @@ def grafico_comparativo(uf: str, cultura: str, n_anos: int, meses, saida: Path):
     janela = f"meses {meses}" if meses else "ano todo"
     titulo = (f"{nome_cultura} em {uf} — precipitação acumulada ({janela}) × produção<br>"
               f"<sup>Pearson: chuva×produção = {r_prod:.2f} | chuva×rendimento = {r_rend:.2f}</sup>")
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_bar(x=df["ano"], y=df["precip_mm"], name="Precipitação (mm)",
+                marker_color="#6baed6", opacity=0.75)
+    fig.add_scatter(x=df["ano"], y=df["producao_t"], name="Produção (t)",
+                    mode="lines+markers", line=dict(color="#238b45", width=3),
+                    secondary_y=True)
+    fig.add_scatter(x=df["ano"], y=df["rendimento_kg_ha"], name="Rendimento (kg/ha)",
+                    mode="lines+markers", line=dict(color="#e6550d", dash="dot"),
+                    secondary_y=True, visible="legendonly")
+    fig.update_layout(title=titulo, template="plotly_white", hovermode="x unified")
+    fig.update_yaxes(title_text="mm", secondary_y=False)
+    fig.update_yaxes(title_text="t  /  kg/ha", secondary_y=True)
+    html = saida / f"comparativo_{uf}_{norm(cultura)}.html"
+    fig.write_html(html)
+
+    # versão estática: dispersão chuva × rendimento
+    d = df.dropna(subset=["precip_mm", "rendimento_kg_ha"])
+    fig2, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(d["precip_mm"], d["rendimento_kg_ha"], c=d["ano"], cmap="viridis", s=70)
+    for _, l in d.iterrows():
+        ax.annotate(int(l["ano"]), (l["precip_mm"], l["rendimento_kg_ha"]),
+                    fontsize=7, xytext=(3, 3), textcoords="offset points")
+    if len(d) > 2:
+        a, b = pd.Series(d["precip_mm"]).pipe(lambda x: (
+            (d["rendimento_kg_ha"].cov(x) / x.var()),
+            d["rendimento_kg_ha"].mean() - d["rendimento_kg_ha"].cov(x) / x.var() * x.mean()))
+        xs = [d["precip_mm"].min(), d["precip_mm"].max()]
+        ax.plot(xs, [a * x + b for x in xs], "r--", lw=1)
+    ax.set(xlabel="Precipitação acumulada (mm)", ylabel="Rendimento médio (kg/ha)",
+           title=f"{nome_cultura} — {uf}  (r = {r_rend:.2f})")
+    png = saida / f"dispersao_{uf}_{norm(cultura)}.png"
+    fig2.tight_layout()
+    fig2.savefig(png, dpi=150)
+    plt.close(fig2)
+    print(f"✔ {html}\n✔ {png}")
+    return df
+
+
+# -----Desafio 2
+def mapa_calor(cultura: str, n_anos: int, meses, saida: Path):
+    nome_cultura, pam = buscar_cultura(cultura, n_anos)
+    prod = (pam.groupby("cod")["rendimento_kg_ha"].mean().dropna()
+               .rename("rendimento").reset_index())
+    ano_ini, ano_fim = int(pam["ano"].min()), int(pam["ano"].max())
+
+    linhas = []
+    for cod in prod["cod"]:
+        c = clima_anual(int(cod), ano_ini, ano_fim, meses)
+        sigla, lat, lon = UFS[int(cod)]
+        linhas.append({"cod": int(cod), "uf": sigla, "lat": lat, "lon": lon,
+                       "precip_mm": c["precip_mm"].mean(), "temp_c": c["temp_c"].mean()})
+    df = prod.merge(pd.DataFrame(linhas), on="cod")
+    df["codarea"] = df["cod"].astype(str)
+
+    geo = buscar_malha_ufs()
+    fig = go.Figure()
+    fig.add_trace(go.Choropleth(
+        geojson=geo, locations=df["codarea"], z=df["rendimento"],
+        featureidkey="properties.codarea", colorscale="YlGn",
+        colorbar=dict(title="Rendimento<br>(kg/ha)", x=1.0), marker_line_width=0.5,
+        text=df["uf"],
+        hovertemplate="<b>%{text}</b><br>Rendimento: %{z:.0f} kg/ha<extra></extra>"))
+    fig.add_trace(go.Scattergeo(
+        lon=df["lon"], lat=df["lat"], mode="markers+text", text=df["uf"],
+        textposition="middle center", textfont=dict(size=9),
+        marker=dict(size=df["precip_mm"] / df["precip_mm"].max() * 38 + 8,
+                    color=df["precip_mm"], colorscale="Blues", opacity=0.55,
+                    line=dict(width=1, color="#08306b"),
+                    colorbar=dict(title="Precip.<br>média (mm)", x=1.12)),
+        customdata=df[["precip_mm", "temp_c"]],
+        hovertemplate=("<b>%{text}</b><br>Precip.: %{customdata[0]:.0f} mm"
+                       "<br>Temp.: %{customdata[1]:.1f} °C<extra></extra>"),
+        showlegend=False))
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_layout(
+        title=f"{nome_cultura}: rendimento médio ({ano_ini}–{ano_fim}) "
+              f"e precipitação (círculos)", margin=dict(l=0, r=0, t=60, b=0))
+    html = saida / f"mapa_{norm(cultura)}.html"
+    fig.write_html(html)
+    print(f"✔ {html}")
+    return df
+
+
+# --------CLI
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--uf", help="Sigla do estado (ex.: MT)")
+    ap.add_argument("--cultura", help="Ex.: soja, milho, trigo, arroz, feijão")
+    ap.add_argument("--anos", type=int, default=15, help="Últimos N anos (padrão 15)")
+    ap.add_argument("--meses", type=int, nargs="*",
+                    help="Meses do ano a considerar no acumulado (ex.: 1 2 3 4)")
+    ap.add_argument("--modo", choices=["grafico", "mapa", "ambos"], default="ambos")
+    ap.add_argument("--saida", default="saida")
+    a = ap.parse_args()
+
+    cultura = a.cultura or input("Cultura (ex.: soja, milho): ").strip()
+    uf = (a.uf or (input("UF (ex.: MT): ").strip() if a.modo != "mapa" else "")).upper()
+    if a.modo != "mapa" and uf not in SIGLA_PARA_COD:
+        sys.exit(f"UF inválida: {uf}. Opções: {', '.join(sorted(SIGLA_PARA_COD))}")
+
+    saida = Path(a.saida)
+    saida.mkdir(exist_ok=True)
+    if a.modo in ("grafico", "ambos"):
+        grafico_comparativo(uf, cultura, a.anos, a.meses, saida)
+    if a.modo in ("mapa", "ambos"):
+        mapa_calor(cultura, a.anos, a.meses, saida)
+
+
+if __name__ == "__main__":
+    main()
