@@ -1,0 +1,13 @@
+[project]
+name = "gnews-api"
+version = "0.1.0"
+description = "API consumption activity using Python – Fatec Carapicuíba"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv",
+    "requests"
+]
+
+[project.scripts]
+gnews-api = "gnews_api.main:main"
